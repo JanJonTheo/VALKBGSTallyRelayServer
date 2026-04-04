@@ -12,7 +12,7 @@
 ---
 
 ## 🚀 Overview
-![Screenshot 2026-04-03 230954.png](screenshots/Screenshot%202026-04-03%20230954.png)
+![Screenshot 2026-04-04 105757.png](screenshots/Screenshot%202026-04-04%20105757.png)
 The **VALK BGS-Tally Relay Server** is a lightweight desktop application designed to act as a local relay between BGS-Tally clients and one or more remote servers.
 
 It receives incoming **Events** and **Activities** via HTTP and forwards them **1:1** to configured target servers — without storing any data locally.
