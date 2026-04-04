@@ -140,6 +140,63 @@ This ensures the relay is always active without manual intervention.
 
 ---
 
+## 🎯 Cmdr-based Filtering
+
+The relay server supports **optional per-target filtering by CMDR name**.
+
+This allows you to forward only specific commanders to selected target servers.
+
+### ⚙️ Configuration
+
+Each relay target can define a list of allowed CMDR names:
+
+```json
+{
+  "name": "Server A",
+  "base_url": "http://127.0.0.1:5000",
+  "cmdr_filters": ["JanJonTheo", "Bulli75"]
+}
+```
+
+### 🧠 Behavior
+
+* If `cmdr_filters` is **set and not empty**:
+
+  * Only matching CMDRs will be forwarded
+* If `cmdr_filters` is **empty or not set**:
+
+  * All data will be forwarded (no filtering)
+
+### 📥 Events (`/events`)
+
+* Incoming events are filtered **per entry**
+* Only matching events are forwarded
+* Non-matching events are discarded for that target
+
+### 📥 Activities (`/activities`)
+
+* The `cmdr` field is evaluated
+* The entire request is forwarded **only if it matches**
+
+---
+
+## 📝 Filter Logging
+
+All filtering actions are fully logged for transparency and debugging.
+
+### Example Logs
+
+```text
+FILTER POST /events -> Server A: 2/10 event(s) matched [JanJonTheo, Bulli75]
+POST /events -> Server A [200] http://127.0.0.1:5000/events (forwarded 2 filtered event(s))
+SKIP POST /events -> Server A: all events filtered out [JanJonTheo, Bulli75]
+
+FILTER PUT /activities -> Server A: activity matched (CMDR: JanJonTheo, filter: [JanJonTheo, Bulli75])
+SKIP PUT /activities -> Server A: activity filtered out (CMDR: RandomCmdr, filter: [JanJonTheo, Bulli75])
+```
+
+---
+
 ## 📄 Logging
 
 All activity is logged to:

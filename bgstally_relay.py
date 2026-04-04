@@ -59,6 +59,8 @@ class HealthStats:
         self.activities_received = 0
         self.forward_success = 0
         self.forward_errors = 0
+        self.filtered_events = 0
+        self.filtered_activities = 0
         self.last_error = "-"
         self.last_forward_status = "No forwarding yet"
         self.recent_request_timestamps: Deque[float] = deque()
@@ -96,6 +98,12 @@ class HealthStats:
         self.recent_forward_results.append((now, False))
         self._trim(now)
 
+    def record_filter_skip(self, kind: str, count: int = 1) -> None:
+        if kind == "events":
+            self.filtered_events += max(0, count)
+        elif kind == "activities":
+            self.filtered_activities += max(0, count)
+
     def snapshot(self) -> Dict[str, object]:
         now = time.time()
         self._trim(now)
@@ -109,6 +117,8 @@ class HealthStats:
             "requests_per_second": round(len(self.recent_request_timestamps) / 60.0, 2),
             "forward_success": self.forward_success,
             "forward_errors": self.forward_errors,
+            "filtered_events": self.filtered_events,
+            "filtered_activities": self.filtered_activities,
             "recent_forward_success": recent_success,
             "recent_forward_errors": recent_errors,
             "last_error": self.last_error,
@@ -140,6 +150,32 @@ LOGGER = setup_logging()
 HEALTH = HealthStats()
 
 
+def normalize_cmdr_name(value: object) -> str:
+    return str(value or "").strip().casefold()
+
+
+def parse_cmdr_filters(value: object) -> List[str]:
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        raw_items = [part.strip() for part in value.replace(";", ",").split(",")]
+    else:
+        raw_items = []
+
+    result: List[str] = []
+    seen = set()
+    for item in raw_items:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
 @dataclass
 class RelayTarget:
     name: str
@@ -150,9 +186,25 @@ class RelayTarget:
     timeout: int = DEFAULT_TIMEOUT
     forward_events: bool = True
     forward_activities: bool = True
+    cmdr_filters: Optional[List[str]] = None
+
+    def __post_init__(self) -> None:
+        self.cmdr_filters = parse_cmdr_filters(self.cmdr_filters)
 
     def endpoint_url(self, path: str) -> str:
         return self.base_url.rstrip("/") + path
+
+    def has_cmdr_filter(self) -> bool:
+        return bool(self.cmdr_filters)
+
+    def allows_cmdr(self, cmdr_name: object) -> bool:
+        if not self.cmdr_filters:
+            return True
+        normalized = normalize_cmdr_name(cmdr_name)
+        return normalized in {name.casefold() for name in self.cmdr_filters}
+
+    def cmdr_filter_text(self) -> str:
+        return ", ".join(self.cmdr_filters or [])
 
 
 class RelayTableModel(QAbstractTableModel):
@@ -163,6 +215,7 @@ class RelayTableModel(QAbstractTableModel):
         "API Key",
         "API Version",
         "Timeout",
+        "Cmdr Filter",
         "Events",
         "Activities",
     ]
@@ -200,12 +253,12 @@ class RelayTableModel(QAbstractTableModel):
                 return Qt.Checked if target.enabled else Qt.Unchecked
             if role == Qt.DisplayRole:
                 return ""
-        elif col == 6:
+        elif col == 7:
             if role == Qt.CheckStateRole:
                 return Qt.Checked if target.forward_events else Qt.Unchecked
             if role == Qt.DisplayRole:
                 return ""
-        elif col == 7:
+        elif col == 8:
             if role == Qt.CheckStateRole:
                 return Qt.Checked if target.forward_activities else Qt.Unchecked
             if role == Qt.DisplayRole:
@@ -218,6 +271,7 @@ class RelayTableModel(QAbstractTableModel):
                     3: target.api_key,
                     4: target.api_version,
                     5: str(target.timeout),
+                    6: target.cmdr_filter_text(),
                 }
                 return mapping.get(col)
         return None
@@ -230,9 +284,9 @@ class RelayTableModel(QAbstractTableModel):
 
         if col == 0 and role == Qt.CheckStateRole:
             target.enabled = value == Qt.Checked
-        elif col == 6 and role == Qt.CheckStateRole:
-            target.forward_events = value == Qt.Checked
         elif col == 7 and role == Qt.CheckStateRole:
+            target.forward_events = value == Qt.Checked
+        elif col == 8 and role == Qt.CheckStateRole:
             target.forward_activities = value == Qt.Checked
         elif role == Qt.EditRole:
             text = str(value)
@@ -249,6 +303,8 @@ class RelayTableModel(QAbstractTableModel):
                     target.timeout = max(1, int(text))
                 except ValueError:
                     return False
+            elif col == 6:
+                target.cmdr_filters = parse_cmdr_filters(text)
             else:
                 return False
         else:
@@ -275,7 +331,12 @@ class RelayTableModel(QAbstractTableModel):
 
     def load_list(self, rows: List[dict]):
         self.beginResetModel()
-        self.targets = [RelayTarget(**row) for row in rows]
+        normalized_rows = []
+        for row in rows:
+            item = dict(row)
+            item.setdefault("cmdr_filters", [])
+            normalized_rows.append(item)
+        self.targets = [RelayTarget(**row) for row in normalized_rows]
         self.endResetModel()
 
 
@@ -300,14 +361,64 @@ class RelayManager(QObject):
             result.append(target)
         return result
 
+    def filter_payload_for_target(self, kind: str, payload, target: RelayTarget):
+        if not target.has_cmdr_filter():
+            return payload
+
+        if kind == "events":
+            filtered = [item for item in payload if target.allows_cmdr(item.get("cmdr"))]
+            return filtered
+
+        if kind == "activities":
+            return payload if target.allows_cmdr(payload.get("cmdr")) else None
+
+        return payload
+
     @Slot(str, str, object)
     def forward(self, path: str, method: str, payload):
-        targets = self.targets_for(path.strip("/"))
+        kind = path.strip("/")
+        targets = self.targets_for(kind)
         if not targets:
             self.log(f"No active relay targets configured for {path}.")
             return
 
         for target in targets:
+            filtered_payload = self.filter_payload_for_target(kind, payload, target)
+
+            if kind == "events":
+                original_count = len(payload) if isinstance(payload, list) else 0
+                filtered_count = len(filtered_payload) if isinstance(filtered_payload, list) else 0
+                if target.has_cmdr_filter():
+                    filtered_out = max(0, original_count - filtered_count)
+                    self.log(
+                        f"FILTER {method} {path} -> {target.name}: "
+                        f"{filtered_count}/{original_count} event(s) matched "
+                        f"[{target.cmdr_filter_text()}]"
+                    )
+                    if filtered_out:
+                        HEALTH.record_filter_skip("events", filtered_out)
+
+                if isinstance(filtered_payload, list) and not filtered_payload:
+                    self.log(
+                        f"SKIP {method} {path} -> {target.name}: all events filtered out "
+                        f"[{target.cmdr_filter_text()}]"
+                    )
+                    continue
+
+            if kind == "activities" and target.has_cmdr_filter():
+                activity_cmdr = payload.get("cmdr") if isinstance(payload, dict) else None
+                if filtered_payload is None:
+                    HEALTH.record_filter_skip("activities", 1)
+                    self.log(
+                        f"SKIP {method} {path} -> {target.name}: activity filtered out "
+                        f"(CMDR: {activity_cmdr or '-'}, filter: [{target.cmdr_filter_text()}])"
+                    )
+                    continue
+                self.log(
+                    f"FILTER {method} {path} -> {target.name}: activity matched "
+                    f"(CMDR: {activity_cmdr or '-'}, filter: [{target.cmdr_filter_text()}])"
+                )
+
             url = target.endpoint_url(path)
             headers = {
                 "Content-Type": "application/json",
@@ -320,12 +431,18 @@ class RelayManager(QObject):
                 response = requests.request(
                     method=method,
                     url=url,
-                    json=payload,
+                    json=filtered_payload,
                     headers=headers,
                     timeout=target.timeout,
                 )
                 HEALTH.record_forward_success(target.name, response.status_code)
-                self.log(f"{method} {path} -> {target.name} [{response.status_code}] {url}")
+                if kind == "events" and isinstance(filtered_payload, list) and target.has_cmdr_filter():
+                    self.log(
+                        f"{method} {path} -> {target.name} [{response.status_code}] {url} "
+                        f"(forwarded {len(filtered_payload)} filtered event(s))"
+                    )
+                else:
+                    self.log(f"{method} {path} -> {target.name} [{response.status_code}] {url}")
             except Exception as exc:
                 HEALTH.record_forward_error(target.name, str(exc))
                 self.log(f"ERROR {method} {path} -> {target.name}: {exc}")
@@ -525,6 +642,8 @@ class MainWindow(QMainWindow):
             ("Activities received", "activities"),
             ("Forward success", "success"),
             ("Forward errors", "errors"),
+            ("Filtered events", "filtered_events"),
+            ("Filtered activities", "filtered_activities"),
             ("Last forward status", "last_status"),
             ("Last error", "last_error"),
             ("Uptime", "uptime"),
@@ -569,6 +688,12 @@ class MainWindow(QMainWindow):
         self.table.setModel(self.model)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(1, 160)
+        self.table.setColumnWidth(2, 250)
+        self.table.setColumnWidth(3, 140)
+        self.table.setColumnWidth(4, 90)
+        self.table.setColumnWidth(5, 70)
+        self.table.setColumnWidth(6, 220)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         layout.addWidget(self.table, 2)
@@ -621,6 +746,8 @@ class MainWindow(QMainWindow):
         self.health_labels["activities"].setText(str(snap["activities_received"]))
         self.health_labels["success"].setText(str(snap["forward_success"]))
         self.health_labels["errors"].setText(str(snap["forward_errors"]))
+        self.health_labels["filtered_events"].setText(str(snap["filtered_events"]))
+        self.health_labels["filtered_activities"].setText(str(snap["filtered_activities"]))
         self.health_labels["last_status"].setText(str(snap["last_forward_status"]))
         self.health_labels["last_error"].setText(str(snap["last_error"]))
         self.health_labels["uptime"].setText(self.format_uptime(int(snap["uptime_seconds"])))
@@ -716,6 +843,7 @@ class MainWindow(QMainWindow):
                         "api_version": "1.6.0",
                         "enabled": True,
                         "timeout": 15,
+                        "cmdr_filters": [],
                         "forward_events": True,
                         "forward_activities": True,
                     }
