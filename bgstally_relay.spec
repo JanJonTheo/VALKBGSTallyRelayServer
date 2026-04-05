@@ -33,4 +33,5 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    icon="VALK_logo.ico",
 )
